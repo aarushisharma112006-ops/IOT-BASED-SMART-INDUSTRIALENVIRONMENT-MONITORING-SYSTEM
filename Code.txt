@@ -1,0 +1,374 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ------------ WIFI DETAILS ------------
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// ------------ EXISTING GPIO PINS ------------
+#define DHT_PIN       4
+#define DHT_TYPE      DHT11
+
+#define RAIN_PIN      34
+#define LDR_PIN       35
+#define MQ_AO         32
+
+#define GREEN_LED     18
+#define RED_LED       19
+#define BUZZER        25
+
+#define OLED_SDA      21
+#define OLED_SCL      22
+
+// ------------ OLED SETTINGS ------------
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+
+DHT dht(DHT_PIN, DHT_TYPE);
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1
+);
+
+bool oledFound = false;
+
+// ------------ THRESHOLDS ------------
+int rainThreshold = 2000;
+int ldrThreshold  = 23;
+int mqThreshold   = 2500;
+
+// These match your previously reported LDR readings:
+// normal room approximately 16, flashlight approximately 30.
+// Adjust if your current raw readings are different.
+
+// ------------ WEB SERVER ------------
+WebServer server(80);
+
+// ------------ SENSOR VALUES ------------
+float temperatureC = NAN;
+float humidity = NAN;
+
+int rainValue = 0;
+int lightValue = 0;
+int mqValue = 0;
+
+bool rainDetected = false;
+bool intenseLight = false;
+bool gasAlert = false;
+
+unsigned long lastSensorRead = 0;
+const unsigned long sensorInterval = 2000;
+
+// ------------ WEBPAGE ------------
+const char webpage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Industrial Monitor</title>
+<style>
+  body {
+    margin: 0;
+    padding: 20px;
+    font-family: Arial, sans-serif;
+    background: #101827;
+    color: #f1f5f9;
+  }
+  h1 { text-align: center; color: #60a5fa; }
+  .subtitle { text-align: center; color: #cbd5e1; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+    gap: 14px;
+    max-width: 900px;
+    margin: 25px auto;
+  }
+  .card {
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 18px;
+    box-shadow: 0 3px 12px #0004;
+  }
+  .name { color: #cbd5e1; font-size: 14px; }
+  .value { font-size: 27px; font-weight: bold; margin-top: 12px; }
+  .status { font-size: 16px; margin-top: 10px; }
+  .good { color: #4ade80; }
+  .alert { color: #fb7185; }
+  .footer { text-align: center; color: #cbd5e1; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Smart Industrial Monitor</h1>
+<p class="subtitle">Live ESP32 Sensor Dashboard</p>
+
+<div class="grid">
+  <div class="card">
+    <div class="name">Temperature</div>
+    <div class="value" id="temp">-- °C</div>
+  </div>
+  <div class="card">
+    <div class="name">Humidity</div>
+    <div class="value" id="hum">-- %</div>
+  </div>
+  <div class="card">
+    <div class="name">LDR Raw Reading</div>
+    <div class="value" id="ldr">--</div>
+    <div class="status" id="lightStatus">Waiting...</div>
+  </div>
+  <div class="card">
+    <div class="name">MQ Gas Sensor Raw</div>
+    <div class="value" id="mq">--</div>
+    <div class="status" id="gasStatus">Waiting...</div>
+  </div>
+  <div class="card">
+    <div class="name">Rain Sensor Raw</div>
+    <div class="value" id="rain">--</div>
+    <div class="status" id="rainStatus">Waiting...</div>
+  </div>
+  <div class="card">
+    <div class="name">Wi-Fi Connection</div>
+    <div class="value" id="wifi">Connected</div>
+    <div class="status good">ESP32 webpage</div>
+  </div>
+</div>
+
+<p class="footer">Refreshes automatically every 2 seconds.</p>
+
+<script>
+async function updateReadings() {
+  try {
+    const response = await fetch('/data');
+    if (!response.ok) throw new Error('Reading unavailable');
+
+    const d = await response.json();
+
+    document.getElementById('temp').textContent =
+      d.temperature_c === null ? 'No reading' : d.temperature_c + ' °C';
+
+    document.getElementById('hum').textContent =
+      d.humidity_percent === null ? 'No reading' : d.humidity_percent + ' %';
+
+    document.getElementById('ldr').textContent = d.ldr_raw;
+    document.getElementById('mq').textContent = d.mq_raw;
+    document.getElementById('rain').textContent = d.rain_raw;
+
+    setStatus('lightStatus', d.intense_light, 'INTENSE LIGHT', 'Normal light');
+    setStatus('gasStatus', d.gas_alert, 'Threshold exceeded', 'Below threshold');
+    setStatus('rainStatus', d.rain_detected, 'Rain detected', 'No rain detected');
+
+    document.getElementById('wifi').textContent = 'Connected';
+  } catch (e) {
+    document.getElementById('wifi').textContent = 'Retrying...';
+  }
+}
+
+function setStatus(id, alert, alertText, normalText) {
+  const el = document.getElementById(id);
+  el.textContent = alert ? alertText : normalText;
+  el.className = 'status ' + (alert ? 'alert' : 'good');
+}
+
+updateReadings();
+setInterval(updateReadings, 2000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ------------ SEND WEBPAGE ------------
+void handleRoot() {
+  server.send_P(200, "text/html", webpage);
+}
+
+// ------------ SEND SENSOR DATA AS JSON ------------
+void handleData() {
+  String json = "{";
+
+  json += "\"temperature_c\":";
+  if (isnan(temperatureC)) json += "null";
+  else json += String(temperatureC, 1);
+
+  json += ",\"humidity_percent\":";
+  if (isnan(humidity)) json += "null";
+  else json += String(humidity, 1);
+
+  json += ",\"ldr_raw\":" + String(lightValue);
+  json += ",\"mq_raw\":" + String(mqValue);
+  json += ",\"rain_raw\":" + String(rainValue);
+
+  json += ",\"intense_light\":";
+  json += (intenseLight ? "true" : "false");
+
+  json += ",\"gas_alert\":";
+  json += (gasAlert ? "true" : "false");
+
+  json += ",\"rain_detected\":";
+  json += (rainDetected ? "true" : "false");
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ------------ READ SENSORS ------------
+void readSensors() {
+  temperatureC = dht.readTemperature();
+  humidity = dht.readHumidity();
+
+  rainValue = analogRead(RAIN_PIN);
+  lightValue = analogRead(LDR_PIN);
+  mqValue = analogRead(MQ_AO);
+
+  // These conditions assume your sensor readings follow
+  // the directions observed in your previous tests.
+  rainDetected = (rainValue < rainThreshold);
+  intenseLight = (lightValue > ldrThreshold);
+  gasAlert = (mqValue > mqThreshold);
+
+  // Only the LDR condition controls the red LED and buzzer.
+  if (intenseLight) {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BUZZER, HIGH);
+  } else {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(BUZZER, LOW);
+  }
+
+  Serial.println("----- SENSOR READINGS -----");
+  Serial.print("Temperature: ");
+  if (isnan(temperatureC)) Serial.println("DHT read error");
+  else Serial.print(temperatureC), Serial.println(" C");
+
+  Serial.print("Humidity: ");
+  if (isnan(humidity)) Serial.println("DHT read error");
+  else Serial.print(humidity), Serial.println(" %");
+
+  Serial.print("LDR raw: ");
+  Serial.println(lightValue);
+
+  Serial.print("MQ raw: ");
+  Serial.println(mqValue);
+
+  Serial.print("Rain raw: ");
+  Serial.println(rainValue);
+
+  Serial.print("Intense light: ");
+  Serial.println(intenseLight ? "YES" : "NO");
+}
+
+// ------------ UPDATE OLED ------------
+void updateOLED() {
+  if (!oledFound) return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  display.println("Industrial Monitor");
+
+  display.print("Temp: ");
+  if (isnan(temperatureC)) display.println("--");
+  else {
+    display.print(temperatureC, 1);
+    display.println(" C");
+  }
+
+  display.print("Humidity: ");
+  if (isnan(humidity)) display.println("--");
+  else {
+    display.print(humidity, 1);
+    display.println(" %");
+  }
+
+  display.print("LDR: ");
+  display.println(lightValue);
+
+  display.print("MQ: ");
+  display.println(mqValue);
+
+  display.print("Rain: ");
+  display.println(rainValue);
+
+  display.print("Light: ");
+  display.println(intenseLight ? "INTENSE!" : "Normal");
+
+  display.display();
+}
+
+// ------------ SETUP ------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(BUZZER, LOW);
+
+  analogReadResolution(12);
+
+  dht.begin();
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  oledFound = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+  if (!oledFound) {
+    Serial.println("OLED not detected at address 0x3C.");
+    Serial.println("Webpage and sensors can still work.");
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to Wi-Fi");
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - wifiStart < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi connected!");
+    Serial.print("Open this webpage: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Wi-Fi connection failed.");
+    Serial.println("Check the Wi-Fi name and password, then reset.");
+  }
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.begin();
+
+  Serial.println("Web server started.");
+
+  readSensors();
+  updateOLED();
+  lastSensorRead = millis();
+}
+
+// ------------ MAIN LOOP ------------
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastSensorRead >= sensorInterval) {
+    lastSensorRead = millis();
+
+    readSensors();
+    updateOLED();
+  }
+
+  delay(2);
+}
